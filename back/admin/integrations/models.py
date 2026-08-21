@@ -221,6 +221,13 @@ class Integration(models.Model):
         return len(self.manifest.get("revoke", []))
 
     @property
+    def can_backfill_ids(self):
+        # True when the manifest's `exists` block declares `store_data`,
+        # meaning we can extract IDs from the lookup response and backfill
+        # them into existing users' extra_fields.
+        return bool(self.manifest.get("exists", {}).get("store_data"))
+
+    @property
     def update_url(self):
         return reverse("integrations:update", args=[self.id])
 
@@ -518,6 +525,8 @@ class Integration(models.Model):
 
         self.new_hire = new_hire
         self.has_user_context = new_hire is not None
+        # copy, not alias - self.params gets mutated later
+        self.params = dict(new_hire.extra_fields)
 
         # Renew token if necessary
         if not self.renew_key():
@@ -530,10 +539,34 @@ class Integration(models.Model):
 
         user_exists = self.tracker.steps.last().found_expected
 
-        if save_result:
-            IntegrationUser.objects.update_or_create(
-                integration=self, user=new_hire, defaults={"revoked": not user_exists}
-            )
+        # If the user was found and the manifest declares store_data on its
+        # exists block, capture those values into extra_fields. Lets a single
+        # lookup populate IDs (e.g. ATLASSIAN_USER_ID, bitwarden_id) for users
+        # that pre-existed in the upstream system.
+        store_data = self.manifest["exists"].get("store_data", {})
+        if save_result and user_exists and store_data:
+            try:
+                json_response = response.json()
+            except (ValueError, AttributeError):
+                json_response = {}
+            updated = False
+            for new_hire_prop, notation in store_data.items():
+                try:
+                    value = get_value_from_notation(
+                        self._replace_vars(notation), json_response
+                    )
+                except KeyError:
+                    continue
+                if value is None:
+                    continue
+                new_hire.extra_fields[new_hire_prop] = value
+                updated = True
+            if updated:
+                new_hire.save(update_fields=["extra_fields"])
+
+        IntegrationUser.objects.update_or_create(
+            integration=self, user=new_hire, defaults={"revoked": not user_exists}
+        )
 
         return user_exists
 
@@ -567,8 +600,8 @@ class Integration(models.Model):
 
         revoke_manifest = self.manifest.get("revoke", [])
 
-        # add extra fields directly to params
-        self.params = self.new_hire.extra_fields
+        # copy, not alias - self.params gets mutated later
+        self.params = dict(self.new_hire.extra_fields)
         self.tracker = IntegrationTracker.objects.create(
             category=IntegrationTracker.Category.REVOKE,
             integration=self if self.pk is not None else None,
